@@ -16,6 +16,7 @@ import pytest
 from torch._dynamo.testing import CompileCounter
 from torch._inductor.utils import fresh_cache
 from move_data import OffloadedModule
+from compressed_tensors.offload.utils import send_tensors
 
 
 class Block(nn.Module):
@@ -96,21 +97,26 @@ def test_per_layer_compiled_blocks():
 
 def test_call_blocks_individually():
     """Each compiled block callable directly — no model.forward needed."""
-    model = LayeredModel(3, 64).cuda()
-    x = torch.randn(2, 64).cuda()
+    model = LayeredModel(3, 64)
+    x = torch.randn(2, 64)
     ref_out = model(x)
 
     blocks = [
-        torch.compile(OffloadedModule(layer), fullgraph=True)
+        torch.compile(OffloadedModule(layer).cuda(), fullgraph=True)
         for layer in model.layers
     ]
 
-    with fresh_cache():
-        out = x
-        for block in blocks:
-            out = block(out)
+    saved_tensors = [x]
 
-    assert torch.allclose(ref_out, out, atol=1e-4)
+    with fresh_cache():
+        for i, block in enumerate(blocks):
+            gpu_input_tensor = send_tensors(saved_tensors[i], "cuda")
+            gpu_layer_output = block(gpu_input_tensor)
+            saved_tensors.append(send_tensors(gpu_layer_output, "cpu"))
+        
+    assert torch.allclose(ref_out, saved_tensors[-1], atol=1e-4)
+    for tensor in saved_tensors:
+        assert tensor.device.type == "cpu"
 
 
 def test_each_layer_executes_compiled():
